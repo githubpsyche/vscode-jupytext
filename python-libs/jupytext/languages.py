@@ -26,6 +26,8 @@ _JUPYTER_LANGUAGES = [
     "spark",
     "sql",
     "cython",
+    "haskell",
+    "tcl",
 ]
 
 # Supported file extensions (and languages)
@@ -58,6 +60,18 @@ _SCRIPT_EXTENSIONS = {
     ".java": {"language": "java", "comment": "//"},
     ".groovy": {"language": "groovy", "comment": "//"},
     ".sage": {"language": "sage", "comment": "#"},
+    ".ml": {
+        "language": "ocaml",
+        "comment": "(*",
+        "comment_suffix": "*)",
+    },  # OCaml only has block comments
+    ".hs": {"language": "haskell", "comment": "--"},
+    ".tcl": {"language": "tcl", "comment": "#"},
+    ".mac": {
+        "language": "maxima",
+        "comment": "/*",
+        "comment_suffix": "*/",
+    },  # Maxima only has block comments
 }
 
 _COMMENT_CHARS = [
@@ -160,11 +174,10 @@ def set_main_and_cell_language(metadata, cells, ext, custom_cell_magics):
                 if "magic_args" in cell["metadata"]:
                     magic_args = cell["metadata"].pop("magic_args")
                     cell["source"] = (
-                        u"{}{} {}\n".format(magic, language, magic_args)
-                        + cell["source"]
+                        f"{magic}{language} {magic_args}\n" + cell["source"]
                     )
                 else:
-                    cell["source"] = u"{}{}\n".format(magic, language) + cell["source"]
+                    cell["source"] = f"{magic}{language}\n" + cell["source"]
 
 
 def cell_language(source, default_language, custom_cell_magics):
@@ -192,8 +205,13 @@ def cell_language(source, default_language, custom_cell_magics):
     return None, None
 
 
-def comment_lines(lines, prefix):
+def comment_lines(lines, prefix, suffix=""):
     """Return commented lines"""
     if not prefix:
         return lines
-    return [prefix + " " + line if line else prefix for line in lines]
+    if not suffix:
+        return [prefix + " " + line if line else prefix for line in lines]
+    return [
+        prefix + " " + line + " " + suffix if line else prefix + " " + suffix
+        for line in lines
+    ]

@@ -8,7 +8,11 @@ import yaml
 from nbformat.v4.nbbase import new_raw_cell
 from yaml.representer import SafeRepresenter
 
-from .languages import _SCRIPT_EXTENSIONS, comment_lines
+from .languages import (
+    _SCRIPT_EXTENSIONS,
+    comment_lines,
+    default_language_from_metadata_and_ext,
+)
 from .metadata_filter import _DEFAULT_NOTEBOOK_METADATA, filter_metadata
 from .pep8 import pep8_lines_between_cells
 from .version import __version__
@@ -31,14 +35,18 @@ def insert_or_test_version_number():
     return INSERT_AND_CHECK_VERSION_NUMBER
 
 
-def uncomment_line(line, prefix):
+def uncomment_line(line, prefix, suffix=""):
     """Remove prefix (and space) from line"""
-    if not prefix:
-        return line
-    if line.startswith(prefix + " "):
-        return line[len(prefix) + 1 :]
-    if line.startswith(prefix):
-        return line[len(prefix) :]
+    if prefix:
+        if line.startswith(prefix + " "):
+            line = line[len(prefix) + 1 :]
+        elif line.startswith(prefix):
+            line = line[len(prefix) :]
+    if suffix:
+        if line.endswith(suffix + " "):
+            line = line[: -(1 + len(suffix))]
+        elif line.endswith(suffix):
+            line = line[: -len(suffix)]
     return line
 
 
@@ -54,7 +62,7 @@ def encoding_and_executable(notebook, metadata, ext):
     if comment is not None:
         if "encoding" in jupytext_metadata:
             lines.append(jupytext_metadata.pop("encoding"))
-        else:
+        elif default_language_from_metadata_and_ext(metadata, ext) != "python":
             for cell in notebook.cells:
                 try:
                     cell.source.encode("ascii")
@@ -133,7 +141,10 @@ def metadata_and_cell_to_header(notebook, metadata, text_format, fmt):
         ):
             header = ["<!--", ""] + header + ["", "-->"]
 
-    return comment_lines(header, text_format.header_prefix), lines_to_next_cell
+    return (
+        comment_lines(header, text_format.header_prefix, text_format.header_suffix),
+        lines_to_next_cell,
+    )
 
 
 def recursive_update(target, update):
@@ -152,11 +163,12 @@ def recursive_update(target, update):
 
 
 def header_to_metadata_and_cell(
-    lines, header_prefix, ext=None, root_level_metadata_as_raw_cell=True
+    lines, header_prefix, header_suffix, ext=None, root_level_metadata_as_raw_cell=True
 ):
     """
     Return the metadata, a boolean to indicate if a jupyter section was found,
-     the first cell of notebook if some metadata is found outside of the jupyter section, and next loc in text
+    the first cell of notebook if some metadata is found outside
+    the jupyter section, and next loc in text
     """
 
     header = []
@@ -173,7 +185,7 @@ def header_to_metadata_and_cell(
     comment = "#" if header_prefix == "#'" else header_prefix
 
     encoding_re = re.compile(
-        r"^[ \t\f]*{}.*?coding[:=][ \t]*([-_.a-zA-Z0-9]+)".format(comment)
+        rf"^[ \t\f]*{re.escape(comment)}.*?coding[:=][ \t]*([-_.a-zA-Z0-9]+)"
     )
 
     for i, line in enumerate(lines):
@@ -203,7 +215,7 @@ def header_to_metadata_and_cell(
             if not started and not line.strip():
                 continue
 
-        line = uncomment_line(line, header_prefix)
+        line = uncomment_line(line, header_prefix, header_suffix)
         if _HEADER_RE.match(line):
             if not started:
                 started = True
@@ -211,6 +223,10 @@ def header_to_metadata_and_cell(
             ended = True
             if in_html_div:
                 continue
+            break
+
+        # Stop if there is something else than a YAML header
+        if not started and line.strip():
             break
 
         if _JUPYTER_RE.match(line):
@@ -225,7 +241,9 @@ def header_to_metadata_and_cell(
 
     if ended:
         if jupyter:
-            recursive_update(metadata, yaml.safe_load("\n".join(jupyter))["jupyter"])
+            extra_metadata = metadata
+            metadata = yaml.safe_load("\n".join(jupyter))["jupyter"]
+            recursive_update(metadata, extra_metadata)
 
         lines_to_next_cell = 1
         if len(lines) > i + 1:

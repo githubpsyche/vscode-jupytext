@@ -32,6 +32,9 @@ JUPYTEXT_CONFIG_FILES = [
 JUPYTEXT_CONFIG_FILES.extend(
     ["." + filename for filename in JUPYTEXT_CONFIG_FILES] + [".jupytext.py"]
 )
+
+PYPROJECT_FILE = "pyproject.toml"
+
 JUPYTEXT_CEILING_DIRECTORIES = [
     path
     for path in os.environ.get("JUPYTEXT_CEILING_DIRECTORIES", "").split(":")
@@ -140,6 +143,13 @@ class JupytextConfiguration(Configurable):
         config=True,
     )
 
+    cm_config_log_level = Enum(
+        values=["warning", "info", "info_if_changed", "debug", "none"],
+        default_value="info_if_changed",
+        help="The log level for config file logs in the Jupytext contents manager",
+        config=True,
+    )
+
     cell_markers = Unicode(
         help='Start and end cell markers for the light format, comma separated. Use "{{{,}}}" to mark cells'
         'as foldable regions in Vim, and "region,endregion" to mark cells as Vscode/PyCharm regions',
@@ -241,6 +251,13 @@ class JupytextConfiguration(Configurable):
 
         return None
 
+    def __eq__(self, other):
+        for key in self.class_trait_names():
+            if getattr(self, key) != getattr(other, key):
+                return False
+
+        return True
+
 
 def preferred_format(incomplete_format, preferred_formats):
     """Return the preferred format for the given extension"""
@@ -290,11 +307,10 @@ def global_jupytext_configuration_directories():
         config_dirs.extend(["/usr/local/share/", "/usr/share/"])
 
     for config_dir in config_dirs:
-        for config_dir_jupytext_or_not in [
+        yield from [
             os.path.join(config_dir, "jupytext"),
             config_dir,
-        ]:
-            yield config_dir_jupytext_or_not
+        ]
 
 
 def find_global_jupytext_configuration_file():
@@ -315,6 +331,15 @@ def find_jupytext_configuration_file(path, search_parent_dirs=True):
             full_path = os.path.join(path, filename)
             if os.path.isfile(full_path):
                 return full_path
+
+    pyproject_path = os.path.join(path, PYPROJECT_FILE)
+    if os.path.isfile(pyproject_path):
+        import toml
+
+        with open(pyproject_path) as stream:
+            doc = toml.loads(stream.read())
+            if doc.get("tool", {}).get("jupytext") is not None:
+                return pyproject_path
 
     if not search_parent_dirs:
         return None
@@ -343,7 +368,11 @@ def parse_jupytext_configuration_file(jupytext_config_file, stream=None):
         if jupytext_config_file.endswith((".toml", "jupytext")):
             import toml
 
-            return toml.loads(stream)
+            doc = toml.loads(stream)
+            if jupytext_config_file.endswith(PYPROJECT_FILE):
+                return doc["tool"]["jupytext"]
+            else:
+                return doc
 
         if jupytext_config_file.endswith((".yml", ".yaml")):
             return yaml.safe_load(stream)

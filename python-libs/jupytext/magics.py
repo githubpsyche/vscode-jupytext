@@ -5,26 +5,27 @@ import re
 from .languages import _COMMENT, _SCRIPT_EXTENSIONS, usual_language_name
 from .stringparser import StringParser
 
+
+def get_comment(ext):
+    return re.escape(_SCRIPT_EXTENSIONS[ext]["comment"])
+
+
 # A magic expression is a line or cell or metakernel magic (#94, #61) escaped zero, or multiple times
 _MAGIC_RE = {
     _SCRIPT_EXTENSIONS[ext]["language"]: re.compile(
-        r"^\s*({0} |{0})*(%|%%|%%%)[a-zA-Z]".format(_SCRIPT_EXTENSIONS[ext]["comment"])
+        r"^\s*({0} |{0})*(%|%%|%%%)[a-zA-Z]".format(get_comment(ext))
     )
     for ext in _SCRIPT_EXTENSIONS
 }
 _MAGIC_FORCE_ESC_RE = {
     _SCRIPT_EXTENSIONS[ext]["language"]: re.compile(
-        r"^\s*({0} |{0})*(%|%%|%%%)[a-zA-Z](.*){0}\s*escape".format(
-            _SCRIPT_EXTENSIONS[ext]["comment"]
-        )
+        r"^\s*({0} |{0})*(%|%%|%%%)[a-zA-Z](.*){0}\s*escape".format(get_comment(ext))
     )
     for ext in _SCRIPT_EXTENSIONS
 }
 _MAGIC_NOT_ESC_RE = {
     _SCRIPT_EXTENSIONS[ext]["language"]: re.compile(
-        r"^\s*({0} |{0})*(%|%%|%%%)[a-zA-Z](.*){0}\s*noescape".format(
-            _SCRIPT_EXTENSIONS[ext]["comment"]
-        )
+        r"^\s*({0} |{0})*(%|%%|%%%)[a-zA-Z](.*){0}\s*noescape".format(get_comment(ext))
     )
     for ext in _SCRIPT_EXTENSIONS
 }
@@ -41,7 +42,7 @@ _MAGIC_FORCE_ESC_RE["csharp"] = re.compile(r"^(// |//)*#![a-zA-Z](.*)//\s*escape
 _MAGIC_FORCE_ESC_RE["csharp"] = re.compile(r"^(// |//)*#![a-zA-Z](.*)//\s*noescape")
 
 # Commands starting with a question or exclamation mark have to be escaped
-_PYTHON_HELP_OR_BASH_CMD = re.compile(r"^\s*(# |#)*\s*(\?|!)\s*[A-Za-z\.\~\$\\\/]")
+_PYTHON_HELP_OR_BASH_CMD = re.compile(r"^\s*(# |#)*\s*(\?|!)\s*[A-Za-z\.\~\$\\\/\{\}]")
 
 # A bash command not followed by an equal sign or a parenthesis is a magic command
 _PYTHON_MAGIC_CMD = re.compile(
@@ -57,6 +58,10 @@ _PYTHON_MAGIC_CMD = re.compile(
 )
 # Python help commands end with ?
 _IPYTHON_MAGIC_HELP = re.compile(r"^\s*(# )*[^\s]*\?\s*$")
+
+_PYTHON_MAGIC_ASSIGN = re.compile(
+    r"^(# |#)*\s*([a-zA-Z_][a-zA-Z_$0-9]*)\s*=\s*(%|%%|%%%|!)[a-zA-Z](.*)"
+)
 
 _SCRIPT_LANGUAGES = [_SCRIPT_EXTENSIONS[ext]["language"] for ext in _SCRIPT_EXTENSIONS]
 
@@ -75,6 +80,8 @@ def is_magic(line, language, global_escape_flag=True, explicitly_code=False):
     if language != "python":
         return False
     if _PYTHON_HELP_OR_BASH_CMD.match(line):
+        return True
+    if _PYTHON_MAGIC_ASSIGN.match(line):
         return True
     if explicitly_code and _IPYTHON_MAGIC_HELP.match(line):
         return True
@@ -160,9 +167,7 @@ _ESCAPED_CODE_START = {
 }
 _ESCAPED_CODE_START.update(
     {
-        ext: re.compile(
-            r"^({0} |{0})*({0}|{0} )\+".format(_SCRIPT_EXTENSIONS[ext]["comment"])
-        )
+        ext: re.compile(r"^({0} |{0})*({0}|{0} )\+".format(get_comment(ext)))
         for ext in _SCRIPT_EXTENSIONS
     }
 )

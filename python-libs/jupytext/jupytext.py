@@ -1,6 +1,5 @@
 """Read and write Jupyter notebooks as text files"""
 
-import io
 import logging
 import os
 import sys
@@ -38,6 +37,7 @@ from .metadata_filter import filter_metadata, update_metadata_filters
 from .myst import MYST_FORMAT_NAME, myst_extensions, myst_to_notebook, notebook_to_myst
 from .pandoc import md_to_notebook, notebook_to_md
 from .pep8 import pep8_lines_between_cells
+from .quarto import notebook_to_qmd, qmd_to_notebook
 from .version import __version__
 
 
@@ -96,6 +96,9 @@ class TextNotebookConverter(NotebookReader, NotebookWriter):
         if self.fmt.get("format_name") == "pandoc":
             return md_to_notebook(s)
 
+        if self.fmt.get("format_name") == "quarto":
+            return qmd_to_notebook(s)
+
         if self.fmt.get("format_name") == MYST_FORMAT_NAME:
             return myst_to_notebook(s)
 
@@ -105,6 +108,7 @@ class TextNotebookConverter(NotebookReader, NotebookWriter):
         metadata, jupyter_md, header_cell, pos = header_to_metadata_and_cell(
             lines,
             self.implementation.header_prefix,
+            self.implementation.header_suffix,
             self.implementation.extension,
             self.fmt.get(
                 "root_level_metadata_as_raw_cell",
@@ -173,80 +177,50 @@ class TextNotebookConverter(NotebookReader, NotebookWriter):
 
         return new_notebook(cells=cells, metadata=metadata)
 
+    def filter_notebook(self, nb, metadata):
+        self.update_fmt_with_notebook_options(nb.metadata)
+        metadata = insert_jupytext_info_and_filter_metadata(
+            metadata, self.fmt, self.implementation
+        )
+
+        cells = []
+        for cell in nb.cells:
+            cell_metadata = filter_metadata(
+                cell.metadata,
+                self.fmt.get("cell_metadata_filter"),
+                _IGNORE_CELL_METADATA,
+            )
+            if cell.cell_type == "code":
+                cells.append(new_code_cell(source=cell.source, metadata=cell_metadata))
+            else:
+                cells.append(
+                    NotebookNode(
+                        source=cell.source,
+                        metadata=cell_metadata,
+                        cell_type=cell.cell_type,
+                    )
+                )
+        return NotebookNode(
+            nbformat=nb.nbformat,
+            nbformat_minor=nb.nbformat_minor,
+            metadata=metadata,
+            cells=cells,
+        )
+
     def writes(self, nb, metadata=None, **kwargs):
         """Return the text representation of the notebook"""
         if self.fmt.get("format_name") == "pandoc":
-            self.update_fmt_with_notebook_options(nb.metadata)
-            metadata = insert_jupytext_info_and_filter_metadata(
-                metadata, self.fmt, self.implementation
-            )
-
-            cells = []
-            for cell in nb.cells:
-                cell_metadata = filter_metadata(
-                    cell.metadata,
-                    self.fmt.get("cell_metadata_filter"),
-                    _IGNORE_CELL_METADATA,
-                )
-                if cell.cell_type == "code":
-                    cells.append(
-                        new_code_cell(source=cell.source, metadata=cell_metadata)
-                    )
-                else:
-                    cells.append(
-                        NotebookNode(
-                            source=cell.source,
-                            metadata=cell_metadata,
-                            cell_type=cell.cell_type,
-                        )
-                    )
-
-            return notebook_to_md(
-                NotebookNode(
-                    nbformat=nb.nbformat,
-                    nbformat_minor=nb.nbformat_minor,
-                    metadata=metadata,
-                    cells=cells,
-                )
-            )
-
+            return notebook_to_md(self.filter_notebook(nb, metadata))
+        if self.fmt.get("format_name") == "quarto" or self.ext == ".qmd":
+            return notebook_to_qmd(self.filter_notebook(nb, metadata))
         if self.fmt.get(
             "format_name"
         ) == MYST_FORMAT_NAME or self.ext in myst_extensions(no_md=True):
             pygments_lexer = metadata.get("language_info", {}).get(
                 "pygments_lexer", None
             )
-            self.update_fmt_with_notebook_options(nb.metadata)
-            metadata = insert_jupytext_info_and_filter_metadata(
-                metadata, self.fmt, self.implementation
-            )
-
-            cells = []
-            for cell in nb.cells:
-                cell_metadata = filter_metadata(
-                    cell.metadata,
-                    self.fmt.get("cell_metadata_filter"),
-                    _IGNORE_CELL_METADATA,
-                )
-                if cell.cell_type == "code":
-                    cells.append(
-                        new_code_cell(source=cell.source, metadata=cell_metadata)
-                    )
-                else:
-                    cells.append(
-                        NotebookNode(
-                            source=cell.source,
-                            metadata=cell_metadata,
-                            cell_type=cell.cell_type,
-                        )
-                    )
             return notebook_to_myst(
-                NotebookNode(
-                    nbformat=nb.nbformat,
-                    nbformat_minor=nb.nbformat_minor,
-                    metadata=metadata,
-                    cells=cells,
-                ),
+                self.filter_notebook(nb, metadata),
                 default_lexer=pygments_lexer,
             )
 
@@ -421,6 +395,9 @@ def read(fp, as_version=nbformat.NO_CONVERT, fmt=None, config=None, **kwargs):
 
     if fp == "-":
         text = sys.stdin.read()
+        # Update the input format by reference if missing
+        if isinstance(fmt, dict) and not fmt:
+            fmt.update(long_form_one_format(divine_format(text)))
         return reads(text, fmt)
 
     if not hasattr(fp, "read"):
@@ -431,7 +408,7 @@ def read(fp, as_version=nbformat.NO_CONVERT, fmt=None, config=None, **kwargs):
         if not isinstance(fmt, dict):
             fmt = long_form_one_format(fmt)
         fmt.update({"extension": ext})
-        with io.open(fp, encoding="utf-8") as stream:
+        with open(fp, encoding="utf-8") as stream:
             return read(stream, as_version=as_version, fmt=fmt, config=config, **kwargs)
 
     if fmt is not None:
@@ -480,20 +457,9 @@ def writes(notebook, fmt, version=nbformat.NO_CONVERT, config=None, **kwargs):
     ext = fmt["extension"]
     format_name = fmt.get("format_name")
 
-    jupytext_metadata = metadata.get("jupytext", {})
-
     if ext == ".ipynb":
-        # Remove jupytext section if empty
-        jupytext_metadata.pop("text_representation", {})
-        if not jupytext_metadata:
-            metadata.pop("jupytext", {})
         return nbformat.writes(
-            NotebookNode(
-                nbformat=notebook.nbformat,
-                nbformat_minor=notebook.nbformat_minor,
-                metadata=metadata,
-                cells=notebook.cells,
-            ),
+            drop_text_representation_metadata(notebook, metadata),
             version,
             **kwargs,
         )
@@ -507,6 +473,27 @@ def writes(notebook, fmt, version=nbformat.NO_CONVERT, config=None, **kwargs):
 
     writer = TextNotebookConverter(fmt, config)
     return writer.writes(notebook, metadata)
+
+
+def drop_text_representation_metadata(notebook, metadata=None):
+    """When the notebook is saved to an ipynb file, we drop the text_representation metadata"""
+    if metadata is None:
+        # Make a copy to avoid modification by reference
+        metadata = deepcopy(notebook["metadata"])
+
+    jupytext_metadata = metadata.get("jupytext", {})
+    jupytext_metadata.pop("text_representation", {})
+
+    # Remove the jupytext section if empty
+    if not jupytext_metadata:
+        metadata.pop("jupytext", {})
+
+    return NotebookNode(
+        nbformat=notebook["nbformat"],
+        nbformat_minor=notebook["nbformat_minor"],
+        metadata=metadata,
+        cells=notebook["cells"],
+    )
 
 
 def write(nb, fp, version=nbformat.NO_CONVERT, fmt=None, config=None, **kwargs):
@@ -537,7 +524,7 @@ def write(nb, fp, version=nbformat.NO_CONVERT, fmt=None, config=None, **kwargs):
         fmt = long_form_one_format(fmt, update={"extension": ext})
         create_prefix_dir(fp, fmt)
 
-        with io.open(fp, "w", encoding="utf-8") as stream:
+        with open(fp, "w", encoding="utf-8") as stream:
             write(nb, stream, version=version, fmt=fmt, config=config, **kwargs)
             return
     else:

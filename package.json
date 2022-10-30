@@ -7,7 +7,7 @@
     "enableProposedApi": true,
     "preview": true,
     "engines": {
-        "vscode": "1.57.0-insider"
+        "vscode": "1.73.0-insider"
     },
     "license": "BSD-3-Clause",
     "icon": "icon.png",
@@ -98,6 +98,10 @@
                 {
                     "command": "jupyter.openAsPairedNotebook",
                     "when": "resourceLangId == rust"
+                },
+                {
+                    "command": "jupyter.openAsPairedNotebook",
+                    "when": "resourceLangId == quarto"
                 }
             ]
         }

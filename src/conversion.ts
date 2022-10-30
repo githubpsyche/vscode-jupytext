@@ -89,7 +89,7 @@ export async function convertFromNotebookToRawContent(
         '-m',
         'jupytext',
         '--to',
-        `${extension.substring(1)}:percent`,
+        `${extension.substring(1)}`,
         uri.fsPath,
         '--output',
         '-',

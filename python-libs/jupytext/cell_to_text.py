@@ -45,7 +45,7 @@ def three_backticks_or_more(lines):
     return code_cell_delimiter
 
 
-class BaseCellExporter(object):
+class BaseCellExporter:
     """A class that represent a notebook cell as text"""
 
     default_comment_magics = None
@@ -77,6 +77,9 @@ class BaseCellExporter(object):
         self.language = self.language or cell.metadata.get("language", default_language)
         self.default_language = default_language
         self.comment = _SCRIPT_EXTENSIONS.get(self.ext, {}).get("comment", "#")
+        self.comment_suffix = _SCRIPT_EXTENSIONS.get(self.ext, {}).get(
+            "comment_suffix", ""
+        )
         self.comment_magics = self.fmt.get(
             "comment_magics", self.default_comment_magics
         )
@@ -147,8 +150,22 @@ class BaseCellExporter(object):
                 left, right = cell_markers.split(",", 1)
             else:
                 left = cell_markers + "\n"
+                if cell_markers.startswith(("r", "R")):
+                    cell_markers = cell_markers[1:]
                 right = "\n" + cell_markers
-            if left[:3] == right[-3:] and left[:3] in ['"""', "'''"]:
+
+            if (
+                left[:3] == right[-3:]
+                or (left[:1] in ["r", "R"] and left[1:4] == right[-3:])
+            ) and right[-3:] in ['"""', "'''"]:
+                # Markdown cells that contain a backslash should be encoded as raw strings
+                if (
+                    left[:1] not in ["r", "R"]
+                    and "\\" in "\n".join(source)
+                    and self.fmt.get("format_name") == "percent"
+                ):
+                    left = "r" + left
+
                 source = copy(source)
                 source[0] = left + source[0]
                 source[-1] = source[-1] + right
@@ -168,7 +185,7 @@ class BaseCellExporter(object):
                 explicitly_code=self.cell_type == "code",
             )
 
-        return comment_lines(source, self.comment)
+        return comment_lines(source, self.comment, self.comment_suffix)
 
     def code_to_text(self):
         """Return the text representation of this cell as a code cell"""
@@ -200,9 +217,9 @@ class MarkdownCellExporter(BaseCellExporter):
             ]
             region_start = " ".join(region_start)
         else:
-            region_start = "<!-- #{} -->".format(code)
+            region_start = f"<!-- #{code} -->"
 
-        return [region_start] + self.source + ["<!-- #end{} -->".format(code)]
+        return [region_start] + self.source + [f"<!-- #end{code} -->"]
 
     def cell_to_text(self):
         """Return the text representation of a cell"""
@@ -267,7 +284,7 @@ class RMarkdownCellExporter(MarkdownCellExporter):
         options = metadata_to_rmd_options(
             self.language, self.metadata, self.use_runtools
         )
-        lines.append("```{{{}}}".format(options))
+        lines.append(f"```{{{options}}}")
         lines.extend(source)
         lines.append("```")
         return lines
@@ -278,7 +295,7 @@ def endofcell_marker(source, comment):
     we add an end-of-cell marker"""
     endofcell = "-"
     while True:
-        endofcell_re = re.compile(r"^{}( )".format(comment) + endofcell + r"\s*$")
+        endofcell_re = re.compile(rf"^{re.escape(comment)}( )" + endofcell + r"\s*$")
         if list(filter(endofcell_re.match, source)):
             endofcell = endofcell + "-"
         else:
@@ -320,7 +337,7 @@ class LightScriptCellExporter(BaseCellExporter):
                 self.unfiltered_metadata = copy(self.unfiltered_metadata)
                 self.unfiltered_metadata.pop("cell_marker", "")
             return True
-        return super(LightScriptCellExporter, self).is_code()
+        return super().is_code()
 
     def code_to_text(self):
         """Return the text representation of a code cell"""
@@ -361,7 +378,7 @@ class LightScriptCellExporter(BaseCellExporter):
             cell_start.append(options)
         lines.append(" ".join(cell_start))
         lines.extend(source)
-        lines.append(self.comment + " {}".format(endofcell))
+        lines.append(self.comment + f" {endofcell}")
         return lines
 
     def explicit_start_marker(self, source):
@@ -450,7 +467,7 @@ class RScriptCellExporter(BaseCellExporter):
             self.metadata["eval"] = False
         options = metadata_to_rmd_options(None, self.metadata, self.use_runtools)
         if options:
-            lines.append("#+ {}".format(options))
+            lines.append(f"#+ {options}")
         lines.extend(source)
         return lines
 
@@ -492,9 +509,13 @@ class DoublePercentCellExporter(BaseCellExporter):  # pylint: disable=W0223
                     indent = left_space.groups()[0]
 
         if options.startswith("%") or not options:
-            lines = [indent + self.comment + " %%" + options]
+            lines = comment_lines(
+                ["%%" + options], indent + self.comment, self.comment_suffix
+            )
         else:
-            lines = [indent + self.comment + " %% " + options]
+            lines = comment_lines(
+                ["%% " + options], indent + self.comment, self.comment_suffix
+            )
 
         if self.is_code() and active:
             source = copy(self.source)
@@ -555,4 +576,4 @@ class SphinxGalleryCellExporter(BaseCellExporter):  # pylint: disable=W0223
             cell_marker
             if cell_marker.startswith("#" * 20)
             else self.default_cell_marker
-        ] + comment_lines(self.source, self.comment)
+        ] + comment_lines(self.source, self.comment, self.comment_suffix)

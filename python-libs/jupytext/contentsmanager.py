@@ -3,7 +3,7 @@
 import itertools
 import os
 from collections import namedtuple
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import nbformat
 from tornado.web import HTTPError
@@ -14,10 +14,9 @@ try:
 except ImportError:
     pass
 
-import jupytext
-
 from .config import (
     JUPYTEXT_CONFIG_FILES,
+    PYPROJECT_FILE,
     JupytextConfiguration,
     JupytextConfigurationError,
     find_global_jupytext_configuration_file,
@@ -30,6 +29,7 @@ from .formats import (
     short_form_multiple_formats,
     short_form_one_format,
 )
+from .jupytext import drop_text_representation_metadata, reads, writes
 from .kernels import set_kernelspec_from_language
 from .paired_paths import (
     InconsistentPath,
@@ -38,7 +38,7 @@ from .paired_paths import (
     full_path,
     paired_paths,
 )
-from .pairs import latest_inputs_and_outputs, read_pair, write_pair
+from .pairs import PairedFilesDiffer, latest_inputs_and_outputs, read_pair, write_pair
 
 
 def build_jupytext_contents_manager_class(base_contents_manager_class):
@@ -57,10 +57,8 @@ def build_jupytext_contents_manager_class(base_contents_manager_class):
             self.paired_notebooks = dict()
 
             # Configuration cache, useful when notebooks are listed in a given directory
-            self.cached_config = namedtuple(
-                "cached_config", "path timestamp config_file config"
-            )
-            self.super = super(JupytextContentsManager, self)
+            self.cached_config = namedtuple("cached_config", "path config_file config")
+            self.super = super()
             self.super.__init__(*args, **kwargs)
 
         def all_nb_extensions(self, config):
@@ -141,7 +139,15 @@ def build_jupytext_contents_manager_class(base_contents_manager_class):
 
                     self.create_prefix_dir(path, fmt)
                     if fmt["extension"] == ".ipynb":
-                        return self.super.save(model, path)
+                        return self.super.save(
+                            dict(
+                                type="notebook",
+                                content=drop_text_representation_metadata(
+                                    model["content"]
+                                ),
+                            ),
+                            path,
+                        )
 
                     if (
                         model["content"]["metadata"]
@@ -159,7 +165,7 @@ def build_jupytext_contents_manager_class(base_contents_manager_class):
                     text_model = dict(
                         type="file",
                         format="text",
-                        content=jupytext.writes(
+                        content=writes(
                             nbformat.from_dict(model["content"]), fmt=fmt, config=config
                         ),
                     )
@@ -169,12 +175,8 @@ def build_jupytext_contents_manager_class(base_contents_manager_class):
                 return write_pair(path, jupytext_formats, save_one_file)
 
             except Exception as e:
-                self.log.error(
-                    u"Error while saving file: %s %s", path, e, exc_info=True
-                )
-                raise HTTPError(
-                    500, u"Unexpected error while saving file: %s %s" % (path, e)
-                )
+                self.log.error("Error while saving file: %s %s", path, e, exc_info=True)
+                raise HTTPError(500, f"Unexpected error while saving file: {path} {e}")
 
         def get(
             self,
@@ -204,7 +206,7 @@ def build_jupytext_contents_manager_class(base_contents_manager_class):
             if ext == ".ipynb":
                 model = self.super.get(path, content, type="notebook", format=format)
             else:
-                model = self.super.get(path, content, type="file", format=format)
+                model = self.super.get(path, content, type="file", format="text")
                 model["type"] = "notebook"
                 if content:
                     # We may need to update these keys, inherited from text files formats
@@ -212,41 +214,39 @@ def build_jupytext_contents_manager_class(base_contents_manager_class):
                     model["format"] = "json"
                     model["mimetype"] = None
                     try:
-                        model["content"] = jupytext.reads(
+                        model["content"] = reads(
                             model["content"], fmt=fmt, config=config
                         )
+                        # mark all code cells from text notebooks as 'trusted'
+                        # as they don't have any outputs, cf. #941
+                        for cell in model["content"].cells:
+                            if cell.cell_type == "code":
+                                cell["metadata"]["trusted"] = True
+
                     except Exception as err:
                         self.log.error(
-                            u"Error while reading file: %s %s", path, err, exc_info=True
+                            "Error while reading file: %s %s", path, err, exc_info=True
                         )
                         raise HTTPError(500, str(err))
 
             if not load_alternative_format:
                 return model
 
-            if not content:
-                # Modification time of a paired notebook, in this context - Jupyter is checking timestamp
-                # before saving - is the most recent among all representations #118
+            # We will now read a second file if this is a paired notebooks.
+            if content:
+                nbk = model["content"]
+                formats = nbk.metadata.get("jupytext", {}).get(
+                    "formats"
+                ) or config.default_formats(path)
+                formats = long_form_multiple_formats(
+                    formats, nbk.metadata, auto_ext_requires_language_info=False
+                )
+            else:
                 if path not in self.paired_notebooks:
                     return model
 
-                fmt, formats = self.paired_notebooks.get(path)
-                for alt_path, _ in paired_paths(path, fmt, formats):
-                    if alt_path != path and self.exists(alt_path):
-                        alt_model = self.super.get(alt_path, content=False)
-                        if alt_model["last_modified"] > model["last_modified"]:
-                            model["last_modified"] = alt_model["last_modified"]
-
-                return model
-
-            # We will now read a second file if this is a paired notebooks.
-            nbk = model["content"]
-            formats = nbk.metadata.get("jupytext", {}).get(
-                "formats"
-            ) or config.default_formats(path)
-            formats = long_form_multiple_formats(
-                formats, nbk.metadata, auto_ext_requires_language_info=False
-            )
+                _, formats = self.paired_notebooks.get(path)
+                formats = long_form_multiple_formats(formats)
 
             # Compute paired notebooks from formats
             alt_paths = [(path, fmt)]
@@ -257,7 +257,7 @@ def build_jupytext_contents_manager_class(base_contents_manager_class):
                     self.update_paired_notebooks(path, formats)
                 except InconsistentPath as err:
                     self.log.error(
-                        u"Unable to read paired notebook: %s %s",
+                        "Unable to read paired notebook: %s %s",
                         path,
                         err,
                         exc_info=True,
@@ -268,7 +268,7 @@ def build_jupytext_contents_manager_class(base_contents_manager_class):
                     alt_paths = paired_paths(path, fmt, formats)
                     formats = long_form_multiple_formats(formats)
 
-            if len(alt_paths) > 1 and ext == ".ipynb":
+            if content and len(alt_paths) > 1 and ext == ".ipynb":
                 # Apply default options (like saving and reloading would do)
                 jupytext_metadata = model["content"]["metadata"].get("jupytext", {})
                 config.set_default_format_options(jupytext_metadata, read=True)
@@ -286,23 +286,30 @@ def build_jupytext_contents_manager_class(base_contents_manager_class):
                 if alt_path == path:
                     return model["content"]
                 if alt_path.endswith(".ipynb"):
-                    self.log.info(u"Reading OUTPUTS from {}".format(alt_path))
+                    self.log.info(f"Reading OUTPUTS from {alt_path}")
                     return self.super.get(
                         alt_path, content=True, type="notebook", format=format
                     )["content"]
 
-                self.log.info(u"Reading SOURCE from {}".format(alt_path))
+                self.log.info(f"Reading SOURCE from {alt_path}")
                 text = self.super.get(
                     alt_path, content=True, type="file", format=format
                 )["content"]
-                return jupytext.reads(text, fmt=alt_fmt, config=config)
+                return reads(text, fmt=alt_fmt, config=config)
 
             inputs, outputs = latest_inputs_and_outputs(
                 path, fmt, formats, get_timestamp, contents_manager_mode=True
             )
 
+            # Modification time of a paired notebook is the timestamp of inputs #118 #978
+            model["last_modified"] = inputs.timestamp
+
+            if not content:
+                return model
+
             # Before we combine the two files, we make sure we're not overwriting ipynb cells
             # with an outdated text file
+            content = None
             try:
                 if (
                     outputs.timestamp
@@ -310,47 +317,67 @@ def build_jupytext_contents_manager_class(base_contents_manager_class):
                     > inputs.timestamp
                     + timedelta(seconds=config.outdated_text_notebook_margin)
                 ):
-                    raise HTTPError(
-                        400,
-                        """{out} (last modified {out_last})
-                        seems more recent than {src} (last modified {src_last})
-                        Please either:
-                        - open {src} in a text editor, make sure it is up to date, and save it,
-                        - or delete {src} if not up to date,
-                        - or increase check margin by adding, say,
-                            outdated_text_notebook_margin = 5  # default is 1 (second)
-                        to your jupytext.toml file
-                        """.format(
+                    ts_mismatch = (
+                        "{out} (last modified {out_last}) is more recent than "
+                        "{src} (last modified {src_last})".format(
                             src=inputs.path,
                             src_last=inputs.timestamp,
                             out=outputs.path,
                             out_last=outputs.timestamp,
-                        ),
+                        )
                     )
+                    self.log.warning(ts_mismatch)
+
+                    try:
+                        content = read_pair(
+                            inputs, outputs, read_one_file, must_match=True
+                        )
+                        self.log.warning(
+                            "The inputs in {src} and {out} are identical, "
+                            "so the mismatch in timestamps was ignored".format(
+                                src=inputs.path, out=outputs.path
+                            )
+                        )
+                    except HTTPError:
+                        raise
+                    except PairedFilesDiffer as diff:
+                        raise HTTPError(
+                            400,
+                            """{ts_mismatch}
+
+Differences (jupytext --diff {src} {out}) are:
+{diff}
+Please either:
+- open {src} in a text editor, make sure it is up to date, and save it,
+- or delete {src} if not up to date,
+- or increase check margin by adding, say,
+outdated_text_notebook_margin = 5  # default is 1 (second)
+to your jupytext.toml file
+                        """.format(
+                                ts_mismatch=ts_mismatch,
+                                src=inputs.path,
+                                out=outputs.path,
+                                diff=diff,
+                            ),
+                        )
             except OverflowError:
                 pass
 
-            try:
-                model["content"] = read_pair(inputs, outputs, read_one_file)
-            except HTTPError:
-                raise
-            except Exception as err:
-                self.log.error(
-                    u"Error while reading file: %s %s", path, err, exc_info=True
-                )
-                raise HTTPError(500, str(err))
+            if content is not None:
+                model["content"] = content
+            else:
+                try:
+                    model["content"] = read_pair(inputs, outputs, read_one_file)
+                except HTTPError:
+                    raise
+                except Exception as err:
+                    self.log.error(
+                        "Error while reading file: %s %s", path, err, exc_info=True
+                    )
+                    raise HTTPError(500, str(err))
 
             if not outputs.timestamp:
                 set_kernelspec_from_language(model["content"])
-
-            # Trust code cells when they have no output
-            for cell in model["content"].cells:
-                if (
-                    cell.cell_type == "code"
-                    and not cell.outputs
-                    and cell.metadata.get("trusted") is False
-                ):
-                    cell.metadata["trusted"] = True
 
             return model
 
@@ -376,7 +403,7 @@ def build_jupytext_contents_manager_class(base_contents_manager_class):
             untitled = self.untitled_notebook
             config = self.get_config(path)
             name = self.increment_notebook_filename(config, untitled + ext, path)
-            path = u"{0}/{1}".format(path, name)
+            path = f"{path}/{name}"
 
             model = {"type": "notebook"}
             if format_name:
@@ -396,13 +423,13 @@ def build_jupytext_contents_manager_class(base_contents_manager_class):
 
             for i in itertools.count():
                 if i:
-                    insert_i = "{}".format(i)
+                    insert_i = f"{i}"
                 else:
                     insert_i = ""
                 basename_i = basename + insert_i
                 name = basename_i + ext
                 if not any(
-                    self.exists(u"{}/{}{}".format(path, basename_i, nb_ext))
+                    self.exists(f"{path}/{basename_i}{nb_ext}")
                     for nb_ext in config.notebook_extensions
                 ):
                     break
@@ -443,7 +470,7 @@ def build_jupytext_contents_manager_class(base_contents_manager_class):
                 raise
             except Exception as err:
                 self.log.error(
-                    u"Error while renaming file from %s to %s: %s",
+                    "Error while renaming file from %s to %s: %s",
                     old_path,
                     new_path,
                     err,
@@ -475,7 +502,21 @@ def build_jupytext_contents_manager_class(base_contents_manager_class):
             for jupytext_config_file in JUPYTEXT_CONFIG_FILES:
                 path = directory + "/" + jupytext_config_file
                 if self.file_exists(path):
+                    if not self.allow_hidden and jupytext_config_file.startswith("."):
+                        self.log.warning(
+                            f"Ignoring config file {path} (see Jupytext issue #964)"
+                        )
+                        continue
                     return path
+
+            pyproject_path = directory + "/" + PYPROJECT_FILE
+            if self.file_exists(pyproject_path):
+                import toml
+
+                model = self.get(pyproject_path, type="file")
+                doc = toml.loads(model["content"])
+                if doc.get("tool", {}).get("jupytext") is not None:
+                    return pyproject_path
 
             if not directory:
                 return None
@@ -483,59 +524,76 @@ def build_jupytext_contents_manager_class(base_contents_manager_class):
             parent_dir = self.get_parent_dir(directory)
             return self.get_config_file(parent_dir)
 
-        def load_config_file(self, config_file, is_os_path=False):
+        def load_config_file(
+            self, config_file, *, prev_config_file, prev_config, is_os_path=False
+        ):
             """Load the configuration file"""
             if config_file is None:
                 return None
-            self.log.info("Loading Jupytext configuration file at %s", config_file)
             if config_file.endswith(".py") and not is_os_path:
                 config_file = self._get_os_path(config_file)
                 is_os_path = True
-            if is_os_path:
-                return load_jupytext_configuration_file(config_file)
-            model = self.super.get(config_file, content=True, type="file")
-            return load_jupytext_configuration_file(config_file, model["content"])
+
+            config_content = None
+            if not is_os_path:
+                try:
+                    model = self.super.get(config_file, content=True, type="file")
+                    config_content = model["content"]
+                except HTTPError:
+                    pass
+
+            config = load_jupytext_configuration_file(config_file, config_content)
+            if config is None:
+                return config
+
+            log_level = config.cm_config_log_level
+            if log_level == "info_if_changed":
+                if config_file != prev_config_file or config != prev_config:
+                    log_level = "info"
+                else:
+                    log_level = "none"
+            if log_level != "none":
+                getattr(self.log, log_level)(
+                    "Loaded Jupytext configuration file at %s", config_file
+                )
+            return config
 
         def get_config(self, path, use_cache=False):
             """Return the Jupytext configuration for the given path"""
             parent_dir = self.get_parent_dir(path)
 
-            # When listing the notebooks for the tree view, we use a one-second
-            # cache for the configuration file
-            if (
-                not use_cache
-                or parent_dir != self.cached_config.path
-                or (
-                    self.cached_config.timestamp + timedelta(seconds=1) < datetime.now()
-                )
-            ):
+            # When listing the notebooks for the tree view, we use a cache for the configuration file
+            # The cache will be refreshed when a notebook is opened or saved, or when we go
+            # to a different directory.
+            if not use_cache or parent_dir != self.cached_config.path:
                 try:
                     config_file = self.get_config_file(parent_dir)
                     if config_file:
-                        self.cached_config.config = self.load_config_file(config_file)
+                        self.cached_config.config = self.load_config_file(
+                            config_file,
+                            prev_config_file=self.cached_config.config_file,
+                            prev_config=self.cached_config.config,
+                        )
                     else:
                         config_file = find_global_jupytext_configuration_file()
                         self.cached_config.config = self.load_config_file(
-                            config_file, True
+                            config_file,
+                            prev_config_file=self.cached_config.config_file,
+                            prev_config=self.cached_config.config,
+                            is_os_path=True,
                         )
                     self.cached_config.config_file = config_file
                     self.cached_config.path = parent_dir
-                    self.cached_config.timestamp = datetime.now()
                 except JupytextConfigurationError as err:
                     self.log.error(
-                        u"Error while reading config file: %s %s",
+                        "Error while reading config file: %s %s",
                         config_file,
                         err,
                         exc_info=True,
                     )
-                    raise HTTPError(500, "{}".format(err))
+                    raise HTTPError(500, f"{err}")
 
             if self.cached_config.config is not None:
-                self.log.debug(
-                    "Configuration file for %s is %s",
-                    path,
-                    self.cached_config.config_file,
-                )
                 return self.cached_config.config
             if isinstance(self.notebook_extensions, str):
                 self.notebook_extensions = self.notebook_extensions.split(",")
@@ -545,11 +603,22 @@ def build_jupytext_contents_manager_class(base_contents_manager_class):
 
 
 try:
-    from notebook.services.contents.largefilemanager import LargeFileManager
+    # The LargeFileManager is taken by default from jupyter_server if available
+    from jupyter_server.services.contents.largefilemanager import LargeFileManager
 
     TextFileContentsManager = build_jupytext_contents_manager_class(LargeFileManager)
 except ImportError:
-    # Older versions of notebook do not have the LargeFileManager #217
-    from notebook.services.contents.filemanager import FileContentsManager
+    # If we can't find jupyter_server then we take it from notebook
+    try:
+        from notebook.services.contents.largefilemanager import LargeFileManager
 
-    TextFileContentsManager = build_jupytext_contents_manager_class(FileContentsManager)
+        TextFileContentsManager = build_jupytext_contents_manager_class(
+            LargeFileManager
+        )
+    except ImportError:
+        # Older versions of notebook do not have the LargeFileManager #217
+        from notebook.services.contents.filemanager import FileContentsManager
+
+        TextFileContentsManager = build_jupytext_contents_manager_class(
+            FileContentsManager
+        )
